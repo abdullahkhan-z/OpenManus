@@ -30,7 +30,6 @@ from app.schema import (
     ToolChoice,
 )
 
-
 REASONING_MODELS = ["o1", "o3-mini"]
 MULTIMODAL_MODELS = [
     "gpt-4-vision-preview",
@@ -180,6 +179,16 @@ class TokenCounter:
 
 class LLM:
     _instances: Dict[str, "LLM"] = {}
+
+    # Define a list of models that do not support tool calls
+    NON_TOOL_MODELS = [
+        "claude-instant-1",
+        "claude-2",
+        "claude-2.0",
+        "claude-2.1",
+        "gemini-1.0-pro",
+        "gemini-pro",
+    ]
 
     def __new__(
         cls, config_name: str = "default", llm_config: Optional[LLMSettings] = None
@@ -357,6 +366,38 @@ class LLM:
                 raise ValueError(f"Invalid role: {msg['role']}")
 
         return formatted_messages
+
+    def enhance_system_prompt_for_non_tool_model(self, system_prompt: str) -> str:
+        """
+        Enhance the system prompt for models that don't support tool calls
+        to guide them to format responses as if they support tools.
+
+        Args:
+            system_prompt: The original system prompt
+
+        Returns:
+            Enhanced system prompt with tool simulation instructions
+        """
+        if self.model not in self.NON_TOOL_MODELS:
+            return system_prompt
+
+        tool_simulation_instructions = """
+You do not support tool calls directly, but you should simulate them in your responses.
+
+When you need to use a tool, format your response like this:
+1. First explain your reasoning and what tool you would use
+2. Then use this format to indicate a function call:
+   [TOOL CALL] function_name({"param1": "value1", "param2": "value2"})
+3. Then continue with what you would expect from the tool response
+
+For example:
+I'll need to search for information about Python.
+[TOOL CALL] web_search({"query": "Python programming language features"})
+Based on the search results, Python is a high-level programming language known for...
+
+Always format JSON parameters with double quotes. Maintain this format throughout our conversation.
+"""
+        return f"{system_prompt}\n\n{tool_simulation_instructions}"
 
     @retry(
         wait=wait_random_exponential(min=1, max=60),
@@ -544,9 +585,7 @@ class LLM:
             multimodal_content = (
                 [{"type": "text", "text": content}]
                 if isinstance(content, str)
-                else content
-                if isinstance(content, list)
-                else []
+                else content if isinstance(content, list) else []
             )
 
             # Add images to content
@@ -680,6 +719,32 @@ class LLM:
             Exception: For unexpected errors
         """
         try:
+            # Check if the model supports tool calls
+            if self.model in self.NON_TOOL_MODELS:
+                # For non-tool models, enhance system messages with tool simulation instructions
+                if system_msgs:
+                    for i, msg in enumerate(system_msgs):
+                        if isinstance(msg, dict) and msg.get("role") == "system":
+                            system_msgs[i]["content"] = (
+                                self.enhance_system_prompt_for_non_tool_model(
+                                    msg["content"]
+                                )
+                            )
+                        elif isinstance(msg, Message) and msg.role == "system":
+                            msg.content = self.enhance_system_prompt_for_non_tool_model(
+                                msg.content
+                            )
+
+                # Fall back to standard ask with enhanced prompt
+                response_content = await self.ask(
+                    messages=messages,
+                    system_msgs=system_msgs,
+                    temperature=temperature,
+                )
+
+                # Create a simulated ChatCompletionMessage
+                return ChatCompletionMessage(content=response_content, role="assistant")
+
             # Validate tool_choice
             if tool_choice not in TOOL_CHOICE_VALUES:
                 raise ValueError(f"Invalid tool_choice: {tool_choice}")
