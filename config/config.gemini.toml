@@ -1,0 +1,21 @@
+# Configuration for Google AI Gemini models
+
+# Global LLM configuration for Gemini model
+[llm]
+model = "gemini-pro"              # The Gemini model to use
+base_url = "https://generativelanguage.googleapis.com/v1beta"  # API endpoint URL
+api_key = "YOUR_GOOGLE_API_KEY"   # Your Google AI Studio API key
+api_type = "google"               # Set API type to google
+max_tokens = 2048                 # Maximum number of tokens in the response
+temperature = 0.2                 # Controls randomness
+
+# Optional configuration for specific LLM models
+[llm.vision]
+model = "gemini-pro-vision"       # The Gemini vision model
+base_url = "https://generativelanguage.googleapis.com/v1beta"  # API endpoint URL for vision model
+api_key = "YOUR_GOOGLE_API_KEY"   # Your Google AI Studio API key for vision model
+api_type = "google"               # Set API type to google
+max_tokens = 2048                 # Maximum number of tokens in the response
+temperature = 0.2                 # Controls randomness for vision model
+
+# Browser configuration remains the same as in the default config
