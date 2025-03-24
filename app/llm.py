@@ -182,12 +182,29 @@ class LLM:
 
     # Define a list of models that do not support tool calls
     NON_TOOL_MODELS = [
+        # Claude models without tool support
         "claude-instant-1",
+        "claude-1",
         "claude-2",
         "claude-2.0",
         "claude-2.1",
+        # Gemini models without tool support
         "gemini-1.0-pro",
         "gemini-pro",
+        # GPT models without tool support
+        "gpt-3.5-turbo-0301",
+        "gpt-3.5-turbo-0613",
+        "gpt-4-0314",
+        "gpt-4-0613",
+        # Ollama models
+        "gemma:27b",
+        "gemma3:27b",
+        "llava:34b",
+        # Add other models as needed
+        "text-bison-001",
+        "command-nightly",
+        "mistral-small",
+        "llama-2-70b-chat",
     ]
 
     def __new__(
@@ -382,20 +399,39 @@ class LLM:
             return system_prompt
 
         tool_simulation_instructions = """
-You do not support tool calls directly, but you should simulate them in your responses.
+You do not support tool calls directly, but you must simulate them in your responses.
 
-When you need to use a tool, format your response like this:
-1. First explain your reasoning and what tool you would use
-2. Then use this format to indicate a function call:
-   [TOOL CALL] function_name({"param1": "value1", "param2": "value2"})
-3. Then continue with what you would expect from the tool response
+When you need to use a tool, ALWAYS format your response exactly like this JSON structure:
+```json
+{
+  "content": null,
+  "tool_calls": [
+    {
+      "id": "call_abc123",
+      "type": "function",
+      "function": {
+        "name": "function_name",
+        "arguments": "{\"param1\":\"value1\",\"param2\":\"value2\"}"
+      }
+    }
+  ]
+}
+```
 
-For example:
-I'll need to search for information about Python.
-[TOOL CALL] web_search({"query": "Python programming language features"})
-Based on the search results, Python is a high-level programming language known for...
+Important rules:
+1. Use "content": null when making a tool call
+2. Generate a unique random string for the "id" field starting with "call_"
+3. The "arguments" must be a valid JSON string with escaped quotes
+4. Always use double quotes for JSON keys and string values
+5. If you need to respond without a tool call, use:
+   ```json
+   {
+     "content": "Your normal response here",
+     "tool_calls": null
+   }
+   ```
 
-Always format JSON parameters with double quotes. Maintain this format throughout our conversation.
+This exact format is critical for compatibility with the OpenAI API.
 """
         return f"{system_prompt}\n\n{tool_simulation_instructions}"
 
@@ -720,7 +756,11 @@ Always format JSON parameters with double quotes. Maintain this format throughou
         """
         try:
             # Check if the model supports tool calls
-            if self.model in self.NON_TOOL_MODELS:
+            model_in_non_tool_list = self.model in self.NON_TOOL_MODELS
+            is_ollama_model = self.api_type == "ollama"
+
+            # Special handling for Ollama models or models in the non-tool list
+            if model_in_non_tool_list or is_ollama_model:
                 # For non-tool models, enhance system messages with tool simulation instructions
                 if system_msgs:
                     for i, msg in enumerate(system_msgs):
@@ -742,8 +782,72 @@ Always format JSON parameters with double quotes. Maintain this format throughou
                     temperature=temperature,
                 )
 
-                # Create a simulated ChatCompletionMessage
-                return ChatCompletionMessage(content=response_content, role="assistant")
+                # Parse the response content as JSON if possible to simulate tool calls
+                try:
+                    import json
+                    import re
+                    import uuid
+
+                    # Try to extract JSON content from the response
+                    json_matches = re.findall(
+                        r"```json\s*(.*?)\s*```", response_content, re.DOTALL
+                    )
+
+                    if json_matches:
+                        # Use the first JSON block found
+                        json_str = json_matches[0]
+                        parsed_resp = json.loads(json_str)
+
+                        # Create a proper ChatCompletionMessage based on the parsed JSON
+                        if "tool_calls" in parsed_resp and parsed_resp["tool_calls"]:
+                            # Make sure each tool call has a proper ID
+                            for i, tool_call in enumerate(parsed_resp["tool_calls"]):
+                                if "id" not in tool_call or not tool_call["id"]:
+                                    # Generate a unique ID if missing
+                                    tool_call["id"] = f"call_{uuid.uuid4().hex[:10]}"
+
+                            # Create a message with tool calls
+                            return ChatCompletionMessage(
+                                content=parsed_resp.get("content"),
+                                tool_calls=parsed_resp["tool_calls"],
+                                role="assistant",
+                            )
+                        else:
+                            # Regular response with content
+                            return ChatCompletionMessage(
+                                content=parsed_resp.get("content", response_content),
+                                role="assistant",
+                            )
+                    else:
+                        # No JSON found, try to parse alternate formats
+                        alternate_format = self._parse_alternate_tool_format(
+                            response_content
+                        )
+
+                        if (
+                            "tool_calls" in alternate_format
+                            and alternate_format["tool_calls"]
+                        ):
+                            # Found tool calls in alternate format
+                            return ChatCompletionMessage(
+                                content=alternate_format.get("content"),
+                                tool_calls=alternate_format["tool_calls"],
+                                role="assistant",
+                            )
+                        else:
+                            # No tool calls found, treat as regular content
+                            return ChatCompletionMessage(
+                                content=alternate_format.get(
+                                    "content", response_content
+                                ),
+                                role="assistant",
+                            )
+                except Exception as e:
+                    logger.warning(f"Error parsing response from non-tool model: {e}")
+                    # Fall back to treating the entire response as content
+                    return ChatCompletionMessage(
+                        content=response_content, role="assistant"
+                    )
 
             # Validate tool_choice
             if tool_choice not in TOOL_CHOICE_VALUES:
@@ -786,11 +890,14 @@ Always format JSON parameters with double quotes. Maintain this format throughou
             params = {
                 "model": self.model,
                 "messages": messages,
-                "tools": tools,
-                "tool_choice": tool_choice,
                 "timeout": timeout,
                 **kwargs,
             }
+
+            # Only add tools and tool_choice params if not using Ollama API
+            if self.api_type != "ollama":
+                params["tools"] = tools
+                params["tool_choice"] = tool_choice
 
             if self.model in REASONING_MODELS:
                 params["max_completion_tokens"] = self.max_tokens
@@ -835,3 +942,68 @@ Always format JSON parameters with double quotes. Maintain this format throughou
         except Exception as e:
             logger.error(f"Unexpected error in ask_tool: {e}")
             raise
+
+    def _parse_alternate_tool_format(self, response_content: str) -> dict:
+        """
+        Parse alternate tool call formats like [TOOL CALL] syntax
+        and convert them to standard OpenAI format.
+
+        Args:
+            response_content: The text response from a non-tool model
+
+        Returns:
+            dict: A properly formatted response with OpenAI-compatible tool_calls if found
+        """
+        import json
+        import re
+        import uuid
+
+        # Check for [TOOL CALL] format: [TOOL CALL] function_name({"param1": "value1"})
+        tool_call_pattern = r"\[TOOL CALL\]\s*(\w+)\((\{.*?\})\)"
+        matches = re.findall(tool_call_pattern, response_content, re.DOTALL)
+
+        if matches:
+            tool_calls = []
+
+            for func_name, args_str in matches:
+                try:
+                    # Try to parse the arguments as JSON
+                    args = json.loads(args_str)
+
+                    # Format properly for OpenAI
+                    tool_calls.append(
+                        {
+                            "id": f"call_{uuid.uuid4().hex[:10]}",
+                            "type": "function",
+                            "function": {
+                                "name": func_name.strip(),
+                                "arguments": json.dumps(args),
+                            },
+                        }
+                    )
+                except json.JSONDecodeError:
+                    # If we can't parse the JSON, use the args string as is
+                    tool_calls.append(
+                        {
+                            "id": f"call_{uuid.uuid4().hex[:10]}",
+                            "type": "function",
+                            "function": {
+                                "name": func_name.strip(),
+                                "arguments": args_str,
+                            },
+                        }
+                    )
+
+            if tool_calls:
+                # Get the text before the first tool call as content
+                first_tool_pos = response_content.find("[TOOL CALL]")
+                content = (
+                    response_content[:first_tool_pos].strip()
+                    if first_tool_pos > 0
+                    else None
+                )
+
+                return {"content": content, "tool_calls": tool_calls}
+
+        # If no tool calls found, return the original content
+        return {"content": response_content}
